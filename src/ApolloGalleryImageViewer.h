@@ -40,7 +40,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) NSInteger currentIndex;
 
 // Set before loading the view when hosting the pager beside comments.
-@property (nonatomic, getter=isEmbedded) BOOL embedded;
+@property (nonatomic, strong, nullable) id duoPlaybackToken;
+@property (nonatomic, readonly, getter=isEmbedded) BOOL embedded;
 
 // Called by the grid when IT loaded more, so the pager picks up the same items
 // without a second request.

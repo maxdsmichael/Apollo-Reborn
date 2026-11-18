@@ -1,6 +1,7 @@
 // ApolloGalleryImageViewer.m — see ApolloGalleryImageViewer.h.
 
 #import "ApolloGalleryImageViewer.h"
+#import "ApolloDuoPlayback.h"
 #import "ApolloGalleryFeed.h"
 #import "ApolloGalleryImageLoader.h"
 #import "ApolloCommon.h"
@@ -105,6 +106,8 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
 @property (nonatomic, strong, nullable) id playerEndObserver;
 @property (nonatomic, copy, nullable) NSURL *videoURL;
 @property (nonatomic, readonly) BOOL hasVideo;
+@property (nonatomic, strong) id duoPlaybackToken;
+@property (nonatomic, copy) BOOL (^duoCanPlay)(void);
 // YES once the FULL-SIZE image is what's on screen. While it's NO, the image
 // view is showing the grid's downsampled thumbnail as a placeholder — which
 // Save/Share must never export.
@@ -275,6 +278,7 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
     self.videoURL = url;
 
     AVPlayer *player = [AVPlayer playerWithURL:url];
+    if (self.duoPlaybackToken) ApolloDuoTagPinnedPlayer(player, self.duoPlaybackToken);
     player.muted = ApolloGalleryViewerVideosMuted();
     // Clips are short and usually watched more than once; looping is what a
     // gallery reader expects and matches how Apollo plays GIF-ish media.
@@ -284,8 +288,10 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
                                                           object:player.currentItem
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(NSNotification *note) {
-        [weakSelf.player seekToTime:kCMTimeZero];
-        [weakSelf.player play];
+        AVPlayer *ended = weakSelf.player;
+        if (!ended || ended.currentItem != note.object || (weakSelf.duoCanPlay && !weakSelf.duoCanPlay())) return;
+        [ended seekToTime:kCMTimeZero];
+        [ended play];
     }];
 
     AVPlayerLayer *layer = [AVPlayerLayer playerLayerWithPlayer:player];
@@ -300,6 +306,7 @@ static void ApolloGalleryViewerActivateAudioSession(void) {
 }
 
 - (void)playIfPossible {
+    if (self.duoCanPlay && !self.duoCanPlay()) return;
     // Players are created LAZILY, for the current page only: adjacent pages a
     // paging collection view keeps materialized show their poster frame and
     // cost no AVPlayer, no buffering, no decoder session. The player appears
@@ -644,6 +651,8 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
 
 @implementation ApolloGalleryImageViewer
 
+- (BOOL)isEmbedded { return self.duoPlaybackToken != nil; }
+
 - (instancetype)initWithFeed:(ApolloGalleryFeed *)feed initialIndex:(NSInteger)initialIndex {
     self = [super initWithNibName:nil bundle:nil];
     if (self) {
@@ -744,7 +753,10 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
 // waiting for the next physical rotation.
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
-    if (self.isEmbedded) return;
+    if (self.isEmbedded) {
+        [self apollo_syncPlayback];
+        return;
+    }
     if (@available(iOS 16.0, *)) {
         [self setNeedsUpdateOfSupportedInterfaceOrientations];
     }
@@ -1507,6 +1519,14 @@ static NSString *ApolloGalleryTimeString(NSTimeInterval seconds) {
                   cellForItemAtIndexPath:(NSIndexPath *)indexPath {
     ApolloGalleryViewerCell *cell = [collectionView dequeueReusableCellWithReuseIdentifier:kApolloGalleryViewerCellID
                                                                              forIndexPath:indexPath];
+    cell.duoPlaybackToken = self.duoPlaybackToken;
+    if (self.isEmbedded) {
+        __weak typeof(self) weakViewer = self;
+        __weak ApolloGalleryViewerCell *weakCell = cell;
+        cell.duoCanPlay = ^BOOL {
+            return weakCell.window && [weakViewer apollo_currentCell] == weakCell;
+        };
+    }
     NSArray<ApolloGalleryItem *> *items = self.feed.items;
     if (indexPath.item < (NSInteger)items.count) {
         [cell configureWithItem:items[indexPath.item]];

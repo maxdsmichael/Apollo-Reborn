@@ -4,6 +4,7 @@
 // at an unfold/fold boundary. UIKit owns all column frames and transitions.
 #import "ApolloDuoSplitView.h"
 #import "ApolloDuoPostPane.h"
+#import "ApolloDuoPlayback.h"
 #import "ApolloDuoSplitDivider.h"
 #import "ApolloDuoDividerGeometry.h"
 #import "ApolloDuoNavigationGestures.h"
@@ -329,6 +330,11 @@ static void ApolloDuoRemoveThreadDragFiller(UIView *filler, NSTimeInterval durat
 @property(nonatomic, weak) UIView *postPaneCoveredFeed;
 @property(nonatomic) BOOL postPaneOriginalAccessibilityHidden;
 @property(nonatomic) BOOL postPaneOnRight;
+@property(nonatomic) BOOL browsingFeed;
+@property(nonatomic) BOOL playbackSuspended;
+@property(nonatomic, weak) UIViewController *threadPage;
+@property(nonatomic, strong) UIButton *mediaPlaceholder;
+@property(nonatomic, weak) UIView *coveredMedia;
 @property(nonatomic, strong) ApolloDuoSplitDivider *dividerGrip;
 @property(nonatomic, strong) NSNumber *dividerPreviewWidth;
 // Text nodes drawing synchronously while the divider resizes the columns.
@@ -598,8 +604,15 @@ static void ApolloDuoRemoveThreadDragFiller(UIView *filler, NSTimeInterval durat
     UIColor *accent = ApolloNavigationButtonAccentColor();
     if (sidebar && sidebar.tintColor != accent) sidebar.tintColor = accent;
 }
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    self.playbackSuspended = NO;
+    [self.view setNeedsLayout];
+}
 - (void)viewDidDisappear:(BOOL)animated {
     [super viewDidDisappear:animated];
+    self.playbackSuspended = YES;
+    ApolloDuoEndPlaybackScope(self);
     [self.dividerGrip cancel];
     self.pendingFeedControlsReveal = NO;
     if (self.subredditList) {
@@ -704,15 +717,41 @@ static void ApolloDuoRemoveThreadDragFiller(UIView *filler, NSTimeInterval durat
     ApolloDuoRefreshLayoutButton(self.feedLayoutButton, self.feedLayoutBarItem);
     [self applyFeedLayoutAvailability];
 }
-// Focused only applies to full-width content; paired columns are both narrow.
-// Dim the control in place instead of removing it, so the bar does not reflow
-// (and the control does not vanish and return) as threads open and close.
 - (void)applyFeedLayoutAvailability {
-    BOOL enabled = !sDuoFeedLayoutChanging && !self.postsColumnsPaired;
-    if (self.feedLayoutButton.enabled != enabled) self.feedLayoutButton.enabled = enabled;
-    if (self.feedLayoutBarItem.enabled != enabled) self.feedLayoutBarItem.enabled = enabled;
+    BOOL canPin = self.postsColumnsPaired && self.threadPage && self.browsingFeed;
+    BOOL enabled = !sDuoFeedLayoutChanging && (!self.postsColumnsPaired || canPin);
+    UIButton *button = self.feedLayoutButton;
+    UIBarButtonItem *item = self.feedLayoutBarItem;
+    UIImage *image = canPin ? [UIImage systemImageNamed:@"pin"] : ApolloDuoFeedLayoutImage();
+    if (button.configuration.image != image) {
+        UIButtonConfiguration *configuration = [button.configuration copy];
+        configuration.image = image;
+        button.configuration = configuration;
+    }
+    if (item.image != image) item.image = image;
+    NSString *label = canPin ? @"Pin Post Beside Comments" : @"Feed Layout";
+    if (![item.title isEqualToString:label]) item.title = label;
+    button.accessibilityLabel = item.accessibilityLabel = label;
+    button.accessibilityHint = item.accessibilityHint = canPin ? @"Show the open post in the feed column."
+        : (sDuoUnfoldedFeedLayout == 2 ? @"Switch to Original feed" : @"Switch to Focused feed");
+    button.accessibilityValue = item.accessibilityValue = canPin ? nil
+        : (sDuoUnfoldedFeedLayout == 2 ? @"Focused feed" : @"Original");
+    if (button.enabled != enabled) button.enabled = enabled;
+    if (item.enabled != enabled) item.enabled = enabled;
 }
-- (void)toggleFeedLayout { ApolloDuoToggleFeedLayout(self); }
+- (void)showFeedBesideThread {
+    self.browsingFeed = YES;
+    [self.view setNeedsLayout];
+    [self.view layoutIfNeeded];
+}
+- (void)toggleFeedLayout {
+    if (self.postsColumnsPaired && self.browsingFeed && self.threadPage) {
+        self.browsingFeed = NO;
+        [self.view setNeedsLayout];
+        return;
+    }
+    ApolloDuoToggleFeedLayout(self);
+}
 - (void)revealRestoredFeedControls {
     if (!self.pendingFeedControlsReveal) return;
     // Buttons start transparent before native item registration. Reveal after
@@ -1766,10 +1805,80 @@ static void ApolloDuoSplitApplySidebarWidth(ApolloDuoSplitState *state, BOOL hal
     }
 }
 
+static __weak ApolloDuoSplitHost *sPinnedHeaderHost;
 static NSString *const kDuoPostPaneOnRight = @"ApolloDuoPostPaneOnRight";
+
+static void ApolloDuoClearMediaPlaceholder(ApolloDuoSplitHost *host) {
+    if (!host.mediaPlaceholder) return;
+    [host.mediaPlaceholder removeFromSuperview];
+    host.coveredMedia.hidden = NO;
+    host.coveredMedia = nil;
+    host.mediaPlaceholder = nil;
+}
+
+static void ApolloDuoCoverThreadMedia(ApolloDuoSplitHost *host, id cell) {
+    if (!host.postPane) return;
+    id rich = nil;
+    if ([cell isKindOfClass:ApolloClassRichMediaHeaderCellNode])
+        rich = ApolloObjectIvar(cell, "richMediaNode");
+    else if ([cell isKindOfClass:ApolloClassCommentsHeaderCellNode])
+        rich = ApolloObjectIvar(ApolloObjectIvar(cell, "crosspostNode"), "richMediaNode");
+    if (!rich) return;
+    UIView *media = ApolloSendObject(rich, @selector(view));
+    if (!media.superview || ![media isDescendantOfView:host.threadPage.viewIfLoaded]) return;
+    if (!host.postPane.hasMedia) {
+        // A host Apollo can render but Gallery cannot is still usable through
+        // the native thread, including its original taps and video player.
+        __weak ApolloDuoPostPane *pane = host.postPane;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (pane && host.postPane == pane) [host showFeedBesideThread];
+        });
+        return;
+    }
+    if (host.coveredMedia == media && host.mediaPlaceholder.superview == media.superview) return;
+    ApolloDuoClearMediaPlaceholder(host);
+    if (media.hidden) return;
+
+    UIButton *placeholder = [UIButton buttonWithType:UIButtonTypeSystem];
+    [placeholder setTitle:@"Media in other pane" forState:UIControlStateNormal];
+    placeholder.accessibilityHint = @"Show the media here and return the other pane to the feed.";
+    placeholder.backgroundColor = UIColor.secondarySystemBackgroundColor;
+    placeholder.translatesAutoresizingMaskIntoConstraints = NO;
+    [placeholder addTarget:host action:@selector(showFeedBesideThread) forControlEvents:UIControlEventTouchUpInside];
+    [media.superview insertSubview:placeholder aboveSubview:media];
+    [NSLayoutConstraint activateConstraints:@[
+        [placeholder.leadingAnchor constraintEqualToAnchor:media.leadingAnchor],
+        [placeholder.trailingAnchor constraintEqualToAnchor:media.trailingAnchor],
+        [placeholder.topAnchor constraintEqualToAnchor:media.topAnchor],
+        [placeholder.bottomAnchor constraintEqualToAnchor:media.bottomAnchor]
+    ]];
+    media.hidden = YES;
+    host.mediaPlaceholder = placeholder;
+    host.coveredMedia = media;
+}
+
+static void ApolloDuoVisitVisibleHeader(ApolloDuoSplitHost *host, BOOL restore) {
+    UITableView *table = ApolloDuoSplitFindTable(host.threadPage.viewIfLoaded);
+    for (UITableViewCell *cell in table.visibleCells) {
+        id node = ApolloSendObject(cell, @selector(node));
+        if (![node isKindOfClass:ApolloClassRichMediaHeaderCellNode]
+            && ![node isKindOfClass:ApolloClassCommentsHeaderCellNode]) continue;
+        if (!restore) {
+            ApolloDuoCoverThreadMedia(host, node);
+            continue;
+        }
+        // Ask the visible native header to re-evaluate autoplay with Apollo's
+        // own settings. Offscreen headers receive this event on scroll-back.
+        SEL visible = @selector(cellNodeVisibilityEvent:inScrollView:withCellFrame:);
+        if ([node respondsToSelector:visible])
+            ((void (*)(id, SEL, unsigned long long, id, CGRect))objc_msgSend)(node, visible, 0, table, cell.frame);
+    }
+}
 
 static void ApolloDuoRemovePostPane(ApolloDuoSplitHost *host) {
     ApolloDuoPostPane *pane = host.postPane;
+    if (sPinnedHeaderHost == host) sPinnedHeaderHost = nil;
+    ApolloDuoClearMediaPlaceholder(host);
     if (!pane) return;
     host.postPaneCoveredFeed.accessibilityElementsHidden = host.postPaneOriginalAccessibilityHidden;
     host.postPaneCoveredFeed = nil;
@@ -1786,16 +1895,13 @@ static void ApolloDuoUpdatePostPane(ApolloDuoSplitHost *host) {
     UINavigationController *feedNavigation = host.postsNavigation;
     if (!feedNavigation) return;
     UINavigationController *commentsNavigation = (id)[host.split viewControllerForColumn:UISplitViewControllerColumnSecondary];
-    id post = nil;
-    if (host.postsColumnsPaired && host.view.bounds.size.width > host.view.bounds.size.height) {
-        Class commentsClass = NSClassFromString(@"Apollo.CommentsViewController");
-        for (UIViewController *page in commentsNavigation.viewControllers.reverseObjectEnumerator) {
-            if (![page isKindOfClass:commentsClass]) continue;
-            post = ApolloObjectIvar(page, "link");
-            break;
-        }
-    }
-    if (host.postPaneModel != post || !post) ApolloDuoRemovePostPane(host);
+    UIViewController *page = commentsNavigation.topViewController;
+    BOOL paired = host.postsColumnsPaired && host.view.bounds.size.width > host.view.bounds.size.height;
+    if (!paired || ![page isKindOfClass:ApolloClassCommentsViewController]) page = nil;
+    id post = ApolloObjectIvar(page, "link");
+    BOOL leavingPinned = host.postPane != nil && host.browsingFeed && host.threadPage == page;
+    host.threadPage = post ? page : nil;
+    if (host.postPaneModel != post || !post || host.browsingFeed) ApolloDuoRemovePostPane(host);
 
     BOOL onRight = post && [NSUserDefaults.standardUserDefaults boolForKey:kDuoPostPaneOnRight];
     if (onRight != host.postPaneOnRight) {
@@ -1812,7 +1918,15 @@ static void ApolloDuoUpdatePostPane(ApolloDuoSplitHost *host) {
             [weakHost.viewIfLoaded setNeedsLayout];
         });
     }
-    if (!post || !feedNavigation.viewIfLoaded.window) return;
+    if (!post || !feedNavigation.viewIfLoaded.window || host.playbackSuspended) {
+        ApolloDuoEndPlaybackScope(host);
+        return;
+    }
+    if (host.browsingFeed) {
+        ApolloDuoSetPlaybackScope(host, host.split.view, nil);
+        if (leavingPinned) ApolloDuoVisitVisibleHeader(host, YES);
+        return;
+    }
 
     UIView *feedView = feedNavigation.view;
     CGRect frame = [host.view convertRect:feedView.bounds fromView:feedView];
@@ -1832,18 +1946,24 @@ static void ApolloDuoUpdatePostPane(ApolloDuoSplitHost *host) {
             if (!live) return;
             [NSUserDefaults.standardUserDefaults setBool:!live.postPaneOnRight forKey:kDuoPostPaneOnRight];
             [live.view setNeedsLayout];
+        } showFeed:^{
+            [weakHost showFeedBesideThread];
         }];
         host.postPaneModel = post;
         host.postPane = pane;
+        sPinnedHeaderHost = host;
+        ApolloDuoSetPlaybackScope(host, host.split.view, pane.playbackToken);
         [host addChildViewController:pane];
         pane.view.frame = frame;
         [pane beginAppearanceTransition:YES animated:NO];
         [host.view insertSubview:pane.view belowSubview:host.listDismiss];
         [pane endAppearanceTransition];
         [pane didMoveToParentViewController:host];
+        ApolloDuoVisitVisibleHeader(host, NO);
     } else if (!CGRectEqualToRect(host.postPane.view.frame, frame)) {
         host.postPane.view.frame = frame;
     }
+    ApolloDuoSetPlaybackScope(host, host.split.view, host.postPane.playbackToken);
     UIView *coveredFeed = feedNavigation.topViewController.viewIfLoaded;
     if (host.postPaneCoveredFeed != coveredFeed) {
         host.postPaneCoveredFeed.accessibilityElementsHidden = host.postPaneOriginalAccessibilityHidden;
@@ -4238,6 +4358,7 @@ static void ApolloDuoSplitClose(ApolloDuoSplitState *state, BOOL preserveDetail)
         [state.host restoreListBackgrounds];
         // Stop suppressing the feed before its item setter runs, then discard
         // this presentation's snapshot so reopening cannot reuse stale items.
+        ApolloDuoEndPlaybackScope(state.host);
         ApolloDuoRemovePostPane(state.host);
         state.host.postsColumnsPaired = NO;
         if (state.feedActions) {
@@ -6036,6 +6157,30 @@ static CGFloat ApolloDuoEmptyStateCenterX(UILabel *label, CGFloat nativeX) {
 
 %end
 
+static void ApolloDuoHeaderBecameVisible(id cell, UIView *table) {
+    ApolloDuoSplitHost *host = sPinnedHeaderHost;
+    if (host && [table isDescendantOfView:host.threadPage.viewIfLoaded]) ApolloDuoCoverThreadMedia(host, cell);
+}
+
+@interface ApolloDuoMediaHeader : NSObject @end
+@interface ApolloDuoCrosspostHeader : NSObject @end
+%group ApolloDuoMediaHeaderHooks
+%hook ApolloDuoMediaHeader
+- (void)cellNodeVisibilityEvent:(unsigned long long)event inScrollView:(UIView *)table withCellFrame:(CGRect)frame {
+    %orig;
+    if (event <= 1) ApolloDuoHeaderBecameVisible(self, table);
+}
+%end
+%end
+%group ApolloDuoCrosspostHeaderHooks
+%hook ApolloDuoCrosspostHeader
+- (void)cellNodeVisibilityEvent:(unsigned long long)event inScrollView:(UIView *)table withCellFrame:(CGRect)frame {
+    %orig;
+    if (event <= 1) ApolloDuoHeaderBecameVisible(self, table);
+}
+%end
+%end
+
 @interface ApolloDuoCommentsPage : UIViewController @end
 @interface ApolloDuoFeedPage : UIViewController @end
 %group ApolloDuoCommentsLayoutHooks
@@ -6049,9 +6194,12 @@ static CGFloat ApolloDuoEmptyStateCenterX(UILabel *label, CGFloat nativeX) {
     UIViewController *page = (UIViewController *)self;
     ApolloDuoPageScheduleLayoutControl(page);
     ApolloDuoSplitState *state = ApolloDuoSplitStateForNavigation(page.navigationController, NO);
-    if (state.host.postsColumnsPaired && state.secondary.topViewController == page
-        && state.host.postPaneModel != ApolloObjectIvar(page, "link")) {
+    if (!state.host.postsColumnsPaired || state.secondary.topViewController != page) return;
+    id link = ApolloObjectIvar(page, "link");
+    if ((link && state.host.threadPage != page) || (!state.host.browsingFeed && state.host.postPaneModel != link)) {
         [state.host.viewIfLoaded setNeedsLayout];
+    } else if (state.host.postPane && !state.host.mediaPlaceholder) {
+        ApolloDuoVisitVisibleHeader(state.host, NO);
     }
 }
 - (void)viewWillDisappear:(BOOL)animated {
@@ -6172,6 +6320,8 @@ static void ApolloDuoSlideFitDisplay(id builder) {
         ApolloLog(@"[DuoSplit] not an iPhone Duo; split view hooks NOT installed");
         return;
     }
+    if (ApolloClassRichMediaHeaderCellNode) %init(ApolloDuoMediaHeaderHooks, ApolloDuoMediaHeader = ApolloClassRichMediaHeaderCellNode);
+    if (ApolloClassCommentsHeaderCellNode) %init(ApolloDuoCrosspostHeaderHooks, ApolloDuoCrosspostHeader = ApolloClassCommentsHeaderCellNode);
     Class comments = NSClassFromString(@"Apollo.CommentsViewController");
     if (comments) %init(ApolloDuoCommentsLayoutHooks, ApolloDuoCommentsPage = comments);
     Class feed = NSClassFromString(@"Apollo.PostsViewController");

@@ -9,18 +9,23 @@
 @property(nonatomic, strong) ApolloGalleryFeed *feed;
 @property(nonatomic, strong) UIView *content;
 @property(nonatomic, copy) dispatch_block_t swapSides;
+@property(nonatomic, copy) dispatch_block_t showFeed;
 @end
 
 @implementation ApolloDuoPostPane
 
-- (instancetype)initWithPost:(id)post swapSides:(dispatch_block_t)swapSides {
+- (instancetype)initWithPost:(id)post swapSides:(dispatch_block_t)swapSides showFeed:(dispatch_block_t)showFeed {
     if ((self = [super initWithNibName:nil bundle:nil])) {
         _post = post;
+        _showFeed = [showFeed copy];
+        _playbackToken = [NSObject new];
         _swapSides = [swapSides copy];
         _feed = ApolloGalleryFeedForPost(post);
     }
     return self;
 }
+
+- (BOOL)hasMedia { return self.feed.items.count > 0; }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -34,11 +39,23 @@
     swap.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:swap];
 
+    UIButton *back = [UIButton buttonWithType:UIButtonTypeSystem];
+    [back setTitle:@"Feed" forState:UIControlStateNormal];
+    [back setImage:[UIImage systemImageNamed:@"list.bullet"] forState:UIControlStateNormal];
+    back.accessibilityLabel = @"Back to Feed";
+    back.accessibilityHint = @"Keeps this thread open in the other column.";
+    [back addTarget:self action:@selector(feedPressed) forControlEvents:UIControlEventTouchUpInside];
+    back.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:back];
+
     self.content = [UIView new];
     self.content.translatesAutoresizingMaskIntoConstraints = NO;
     [self.view addSubview:self.content];
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
+        [back.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [back.centerYAnchor constraintEqualToAnchor:swap.centerYAnchor],
+        [back.heightAnchor constraintEqualToConstant:44],
         [swap.topAnchor constraintEqualToAnchor:safe.topAnchor],
         [swap.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-8],
         [swap.widthAnchor constraintEqualToConstant:44],
@@ -67,6 +84,8 @@
     }
 }
 
+- (void)feedPressed { self.showFeed(); }
+
 - (void)swapPressed {
     self.swapSides();
 }
@@ -74,7 +93,7 @@
 - (void)revealMedia:(UIButton *)sender {
     [sender removeFromSuperview];
     ApolloGalleryImageViewer *viewer = [[ApolloGalleryImageViewer alloc] initWithFeed:self.feed initialIndex:0];
-    viewer.embedded = YES;
+    viewer.duoPlaybackToken = self.playbackToken;
     [self addChildViewController:viewer];
     viewer.view.frame = self.content.bounds;
     viewer.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
