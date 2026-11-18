@@ -678,7 +678,7 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = UIColor.blackColor;
-    self.view.accessibilityViewIsModal = YES;
+    self.view.accessibilityViewIsModal = !self.isEmbedded;
     // The viewer is a black fullscreen surface with white text and icons, but
     // the APP is usually in light mode — so the iOS 26 glass pills first
     // resolved their LIGHT variant (white frost, unreadable white-on-white
@@ -719,14 +719,17 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
     longPress.delegate = self;
     [self.view addGestureRecognizer:longPress];
 
-    self.dismissPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(apollo_dismissPanned:)];
-    self.dismissPan.delegate = self;
-    [self.view addGestureRecognizer:self.dismissPan];
+    if (!self.isEmbedded) {
+        self.dismissPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(apollo_dismissPanned:)];
+        self.dismissPan.delegate = self;
+        [self.view addGestureRecognizer:self.dismissPan];
+    }
 
     [self apollo_updateChromeContent];
 
     // Physical device orientation keeps reporting while the INTERFACE is
     // locked, which is what makes the smart-rotation offer possible.
+    if (self.isEmbedded) return;
     [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(apollo_deviceOrientationChanged:)
@@ -741,6 +744,7 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
 // waiting for the next physical rotation.
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
+    if (self.isEmbedded) return;
     if (@available(iOS 16.0, *)) {
         [self setNeedsUpdateOfSupportedInterfaceOrientations];
     }
@@ -773,7 +777,9 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
     [[NSNotificationCenter defaultCenter] removeObserver:self
                                                     name:UIDeviceOrientationDidChangeNotification
                                                   object:nil];
-    [[UIDevice currentDevice] endGeneratingDeviceOrientationNotifications];
+    if (!self.isEmbedded && self.isViewLoaded) {
+        [[UIDevice currentDevice] endGeneratingDeviceOrientationNotifications];
+    }
 }
 
 - (void)didReceiveMemoryWarning {
@@ -845,7 +851,7 @@ static UIButton *ApolloGalleryChromeButton(UIImage *symbol, NSString *title, UIV
 - (void)apollo_buildChrome {
     self.doneButton = ApolloGalleryChromeButton(nil, @"Done", &_doneHost);
     [self.doneButton addTarget:self action:@selector(apollo_donePressed) forControlEvents:UIControlEventTouchUpInside];
-    [self.view addSubview:self.doneHost];
+    if (!self.isEmbedded) [self.view addSubview:self.doneHost];
 
     self.counterLabel = [[UILabel alloc] initWithFrame:CGRectZero];
     self.counterLabel.textColor = UIColor.whiteColor;
@@ -1122,7 +1128,7 @@ static UIInterfaceOrientation ApolloGalleryInterfaceOrientationForDevice(UIDevic
 
 - (void)apollo_layoutChrome {
     CGRect bounds = self.view.bounds;
-    UIEdgeInsets safe = ApolloDeviceChromeInsetsForView(self.view);
+    UIEdgeInsets safe = self.isEmbedded ? self.view.safeAreaInsets : ApolloDeviceChromeInsetsForView(self.view);
 
     CGFloat top = safe.top + 12.0;
     CGFloat side = MAX(16.0, safe.left + 16.0);
@@ -2119,7 +2125,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
                                               handler:^(__kindof UIAction *a) {
             [weakSelf apollo_sharePostLinkFromView:weakSelf.shareButton];
         }]];
-        [children addObject:[UIAction actionWithTitle:@"Open Post"
+        if (!self.isEmbedded) [children addObject:[UIAction actionWithTitle:@"Open Post"
                                                 image:[UIImage systemImageNamed:@"arrow.up.right.square"]
                                            identifier:nil
                                               handler:^(__kindof UIAction *a) { [weakSelf apollo_openCurrentPost]; }]];
@@ -2298,6 +2304,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
 }
 
 - (void)apollo_openPostURL:(NSURL *)postURL {
+    if (self.isEmbedded) return;
     UIWindowScene *originatingScene = self.viewIfLoaded.window.windowScene;
     if (!postURL || !originatingScene || self.isDismissing || self.mediaMenuSession) return;
     [self apollo_dismissToGalleryWithFlickDirection:0.0 completion:^{

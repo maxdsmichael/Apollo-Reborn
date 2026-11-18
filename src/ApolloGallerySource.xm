@@ -117,6 +117,15 @@ static NSDictionary *ApolloGallerySourcePostWithLiveFlags(NSDictionary *post, id
     return current;
 }
 
+ApolloGalleryFeed *ApolloGalleryFeedForPost(id link) {
+    NSDictionary *post = objc_getAssociatedObject(link, &kApolloGallerySourcePostKey);
+    if (!post) return nil;
+    ApolloGalleryFeed *feed = [[ApolloGalleryFeed alloc] initWithHomeFeed];
+    NSDictionary *listing = @{@"children": @[@{@"kind": @"t3",
+        @"data": ApolloGallerySourcePostWithLiveFlags(post, link, YES)}]};
+    return [feed seedFromListing:listing] ? feed : nil;
+}
+
 #pragma mark - Reading a complete native listing
 
 static BOOL ApolloGallerySourceReadIvarBytes(id object, const char *name, void *bytes, size_t length) {

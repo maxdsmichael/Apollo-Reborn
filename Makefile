@@ -88,6 +88,7 @@ ApolloReborn_FILES = \
     $(SRC_DIR)/ApolloDeviceDisplay.m \
     $(SRC_DIR)/ApolloDeviceDisplayHooks.xm \
     $(SRC_DIR)/ApolloDuoSplitView.xm \
+    $(SRC_DIR)/ApolloDuoPostPane.m \
     $(SRC_DIR)/ApolloDuoAccount.m \
     $(SRC_DIR)/ApolloDuoRailCore.m \
     $(SRC_DIR)/ApolloDuoNavigationGestures.m \

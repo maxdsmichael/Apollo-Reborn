@@ -26,5 +26,8 @@ NSDictionary * _Nullable ApolloGallerySourcePreparationState(UIViewController *s
 // a loading state, or retain a cursor if more category posts remain uninspected.
 BOOL ApolloGallerySeedFeedFromSource(ApolloGalleryFeed *feed, UIViewController *sourceViewController);
 
+// Build a finite gallery from the media metadata already attached to one post.
+ApolloGalleryFeed * _Nullable ApolloGalleryFeedForPost(id link);
+
 __END_DECLS
 NS_ASSUME_NONNULL_END

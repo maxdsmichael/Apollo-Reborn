@@ -39,6 +39,9 @@ NS_ASSUME_NONNULL_BEGIN
 // Index of the picture currently on screen.
 @property (nonatomic, readonly) NSInteger currentIndex;
 
+// Set before loading the view when hosting the pager beside comments.
+@property (nonatomic, getter=isEmbedded) BOOL embedded;
+
 // Called by the grid when IT loaded more, so the pager picks up the same items
 // without a second request.
 - (void)feedDidAppendItems;

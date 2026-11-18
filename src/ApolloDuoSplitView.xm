@@ -3,6 +3,7 @@
 // switching can keep addressing that object. Only its visible contents change
 // at an unfold/fold boundary. UIKit owns all column frames and transitions.
 #import "ApolloDuoSplitView.h"
+#import "ApolloDuoPostPane.h"
 #import "ApolloDuoSplitDivider.h"
 #import "ApolloDuoDividerGeometry.h"
 #import "ApolloDuoNavigationGestures.h"
@@ -38,6 +39,7 @@ static UITableView *ApolloDuoSplitFindTable(UIView *view);
 static void ApolloDuoPostsStopGeometry(UIView *feed);
 @class ApolloDuoSplitHost;
 static void ApolloDuoUpdateDivider(ApolloDuoSplitHost *host);
+static void ApolloDuoUpdatePostPane(ApolloDuoSplitHost *host);
 static void ApolloDuoToggleFeedLayout(ApolloDuoSplitHost *host);
 static void ApolloDuoToggleVisibleFeedLayout(UIViewController *controller, BOOL enabled);
 
@@ -322,6 +324,11 @@ static void ApolloDuoRemoveThreadDragFiller(UIView *filler, NSTimeInterval durat
 @property(nonatomic) BOOL postsShowingDetail;
 @property(nonatomic) BOOL postsSplitEnabled;
 @property(nonatomic) BOOL postsColumnsPaired;
+@property(nonatomic, strong) ApolloDuoPostPane *postPane;
+@property(nonatomic, weak) id postPaneModel;
+@property(nonatomic, weak) UIView *postPaneCoveredFeed;
+@property(nonatomic) BOOL postPaneOriginalAccessibilityHidden;
+@property(nonatomic) BOOL postPaneOnRight;
 @property(nonatomic, strong) ApolloDuoSplitDivider *dividerGrip;
 @property(nonatomic, strong) NSNumber *dividerPreviewWidth;
 // Text nodes drawing synchronously while the divider resizes the columns.
@@ -1095,6 +1102,7 @@ static BOOL ApolloDuoSafeAreaInsetsMatch(UIEdgeInsets a, UIEdgeInsets b) {
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     [self scheduleSplitSafeAreaSync];
+    ApolloDuoUpdatePostPane(self);
     ApolloDuoUpdateDivider(self);
     if (self.subredditList) {
         CGFloat width = MIN(360, self.view.bounds.size.width - 96);
@@ -1504,6 +1512,11 @@ CGRect ApolloDuoSplitContentFrame(UIViewController *controller, UIView *coordina
     // Center across the whole detail pane, including its trailing navigation
     // strip. Only the leading sidebar is excluded from this alignment band.
     insets.right = 0.0;
+    if (nav == state.secondary && state.host.postPaneOnRight) {
+        UIView *feed = state.feed.viewIfLoaded;
+        CGFloat divider = [view convertRect:feed.bounds fromView:feed].origin.x;
+        insets.right = MAX(0.0, CGRectGetMaxX(view.bounds) - divider);
+    }
     CGRect content = UIEdgeInsetsInsetRect(view.bounds, insets);
     CGRect column = [coordinateView convertRect:content fromView:view];
     // A page rests at its navigation view's origin, but a push parks the
@@ -1719,10 +1732,12 @@ static void ApolloDuoSplitApplySidebarWidth(ApolloDuoSplitState *state, BOOL hal
     if (postsLandscape && CGRectIsNull(fold)) {
         double share = [NSUserDefaults.standardUserDefaults doubleForKey:UDKeyDuoDividerFeedShare];
         if (!(share > 0 && share < 1) || !isfinite(share)) share = 0.5;
-        CGFloat inset = MAX(state.host.view.safeAreaInsets.right, state.secondary.view.safeAreaInsets.right);
+        CGFloat inset = state.host.view.safeAreaInsets.right;
+        if (!state.host.postPaneOnRight) inset = MAX(inset, state.secondary.view.safeAreaInsets.right);
         postsWidth = ApolloDuoDividerClamp(state.host.dividerPreviewWidth ? state.host.dividerPreviewWidth.doubleValue : share * canvas.width,
                                            canvas.width, inset);
     }
+    if (postsLandscape && state.host.postPaneOnRight) postsWidth = canvas.width - postsWidth;
     // Pin the requested width so ordinary swipes never resize the divider.
     CGFloat maximum = postsLandscape ? postsWidth : (state.feed || halfWidth ? CGFLOAT_MAX : 420.0);
     // Settings' widest native row is "Touch ID & Passcode" + its value +
@@ -1748,6 +1763,93 @@ static void ApolloDuoSplitApplySidebarWidth(ApolloDuoSplitState *state, BOOL hal
     if (halfWidth && !state.feed) {
         split.preferredDisplayMode = UISplitViewControllerDisplayModeOneBesideSecondary;
         [split showColumn:UISplitViewControllerColumnPrimary];
+    }
+}
+
+static NSString *const kDuoPostPaneOnRight = @"ApolloDuoPostPaneOnRight";
+
+static void ApolloDuoRemovePostPane(ApolloDuoSplitHost *host) {
+    ApolloDuoPostPane *pane = host.postPane;
+    if (!pane) return;
+    host.postPaneCoveredFeed.accessibilityElementsHidden = host.postPaneOriginalAccessibilityHidden;
+    host.postPaneCoveredFeed = nil;
+    [pane willMoveToParentViewController:nil];
+    [pane beginAppearanceTransition:NO animated:NO];
+    [pane.view removeFromSuperview];
+    [pane endAppearanceTransition];
+    [pane removeFromParentViewController];
+    host.postPane = nil;
+    host.postPaneModel = nil;
+}
+
+static void ApolloDuoUpdatePostPane(ApolloDuoSplitHost *host) {
+    UINavigationController *feedNavigation = host.postsNavigation;
+    if (!feedNavigation) return;
+    UINavigationController *commentsNavigation = (id)[host.split viewControllerForColumn:UISplitViewControllerColumnSecondary];
+    id post = nil;
+    if (host.postsColumnsPaired && host.view.bounds.size.width > host.view.bounds.size.height) {
+        Class commentsClass = NSClassFromString(@"Apollo.CommentsViewController");
+        for (UIViewController *page in commentsNavigation.viewControllers.reverseObjectEnumerator) {
+            if (![page isKindOfClass:commentsClass]) continue;
+            post = ApolloObjectIvar(page, "link");
+            break;
+        }
+    }
+    if (host.postPaneModel != post || !post) ApolloDuoRemovePostPane(host);
+
+    BOOL onRight = post && [NSUserDefaults.standardUserDefaults boolForKey:kDuoPostPaneOnRight];
+    if (onRight != host.postPaneOnRight) {
+        host.postPaneOnRight = onRight;
+        host.split.primaryEdge = onRight ? UISplitViewControllerPrimaryEdgeTrailing : UISplitViewControllerPrimaryEdgeLeading;
+        ApolloDuoSplitState *state = ApolloDuoSplitStateForNavigation(feedNavigation, NO);
+        ApolloDuoSplitApplySidebarWidth(state, state.halfWidthSidebar);
+        [host.split.view setNeedsLayout];
+        [host.split.view layoutIfNeeded];
+        // UIKit can move its column wrappers after the host's layout pass.
+        // Read the final feed frame on the next turn when the edge changes.
+        __weak ApolloDuoSplitHost *weakHost = host;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakHost.viewIfLoaded setNeedsLayout];
+        });
+    }
+    if (!post || !feedNavigation.viewIfLoaded.window) return;
+
+    UIView *feedView = feedNavigation.view;
+    CGRect frame = [host.view convertRect:feedView.bounds fromView:feedView];
+    CGRect navBar = [host.view convertRect:feedNavigation.navigationBar.bounds fromView:feedNavigation.navigationBar];
+    CGFloat top = MAX(CGRectGetMinY(frame), CGRectGetMaxY(navBar));
+    frame.size.height = MAX(0, CGRectGetMaxY(frame) - top);
+    frame.origin.y = top;
+    UIEdgeInsets insets = host.view.safeAreaInsets;
+    CGRect readableWidth = UIEdgeInsetsInsetRect(host.view.bounds, UIEdgeInsetsMake(0, insets.left, 0, insets.right));
+    frame = CGRectIntersection(frame, readableWidth);
+    if (CGRectIsEmpty(frame) || CGRectIsNull(frame)) return;
+
+    if (!host.postPane) {
+        __weak ApolloDuoSplitHost *weakHost = host;
+        ApolloDuoPostPane *pane = [[ApolloDuoPostPane alloc] initWithPost:post swapSides:^{
+            ApolloDuoSplitHost *live = weakHost;
+            if (!live) return;
+            [NSUserDefaults.standardUserDefaults setBool:!live.postPaneOnRight forKey:kDuoPostPaneOnRight];
+            [live.view setNeedsLayout];
+        }];
+        host.postPaneModel = post;
+        host.postPane = pane;
+        [host addChildViewController:pane];
+        pane.view.frame = frame;
+        [pane beginAppearanceTransition:YES animated:NO];
+        [host.view insertSubview:pane.view belowSubview:host.listDismiss];
+        [pane endAppearanceTransition];
+        [pane didMoveToParentViewController:host];
+    } else if (!CGRectEqualToRect(host.postPane.view.frame, frame)) {
+        host.postPane.view.frame = frame;
+    }
+    UIView *coveredFeed = feedNavigation.topViewController.viewIfLoaded;
+    if (host.postPaneCoveredFeed != coveredFeed) {
+        host.postPaneCoveredFeed.accessibilityElementsHidden = host.postPaneOriginalAccessibilityHidden;
+        host.postPaneCoveredFeed = coveredFeed;
+        host.postPaneOriginalAccessibilityHidden = coveredFeed.accessibilityElementsHidden;
+        coveredFeed.accessibilityElementsHidden = YES;
     }
 }
 
@@ -1837,9 +1939,11 @@ static void ApolloDuoUpdateDivider(ApolloDuoSplitHost *host) {
     // The secondary navigation view spans the canvas on Duo; UIKit insets
     // its content behind the primary. The feed edge is the actual divider.
     CGRect frame = [host.postsNavigation.view convertRect:host.postsNavigation.view.bounds toView:host.view];
-    CGFloat inset = MAX(host.view.safeAreaInsets.right, thread.view.safeAreaInsets.right);
-    [host.dividerGrip updateWithDivider:CGRectGetMaxX(frame) trailingInset:inset
-                               enabled:ApolloDuoDividerVisible(host) && CGRectGetMaxX(frame) > 0];
+    CGFloat inset = host.view.safeAreaInsets.right;
+    if (!host.postPaneOnRight) inset = MAX(inset, thread.view.safeAreaInsets.right);
+    CGFloat divider = host.postPaneOnRight ? CGRectGetMinX(frame) : CGRectGetMaxX(frame);
+    [host.dividerGrip updateWithDivider:divider trailingInset:inset
+                               enabled:ApolloDuoDividerVisible(host) && divider > 0];
 }
 
 BOOL ApolloDuoRequiresSubredditEnhancements(void) {
@@ -2155,7 +2259,13 @@ static CGRect ApolloDuoPostsDetailPane(ApolloDuoSplitState *state) {
     // its navigation chrome and trailing rail.
     CGRect pane = UIEdgeInsetsInsetRect(detail.bounds,
         UIEdgeInsetsMake(0, detail.safeAreaInsets.left, 0, 0));
-    return CGRectIntersection(surface.bounds, [surface convertRect:pane fromView:detail]);
+    pane = [surface convertRect:pane fromView:detail];
+    if (state.host.postPaneOnRight) {
+        UIView *feed = state.feed.view;
+        CGFloat divider = [surface convertRect:feed.bounds fromView:feed].origin.x;
+        pane.size.width = MAX(0, MIN(CGRectGetMaxX(pane), divider) - CGRectGetMinX(pane));
+    }
+    return CGRectIntersection(surface.bounds, pane);
 }
 
 // Text in a Texture node is drawn into its layer's contents, and redrawn in
@@ -3021,7 +3131,8 @@ BOOL ApolloDuoSplitPopRevealsContent(UINavigationController *nav) {
 BOOL ApolloDuoSplitCanDragThreadClosed(UINavigationController *nav) {
     ApolloDuoSplitState *state = ApolloDuoSplitStateForNavigation(nav, NO);
     return state.split && state.feed && !state.changing && nav == state.secondary
-        && state.host.postsShowingDetail && nav.viewControllers.count == 2 && state.host.view.window;
+        && state.host.postsShowingDetail && !state.host.postPaneOnRight
+        && nav.viewControllers.count == 2 && state.host.view.window;
 }
 
 // Starts a thread drag from wherever the pane is (mid-spring included) and
@@ -4127,6 +4238,7 @@ static void ApolloDuoSplitClose(ApolloDuoSplitState *state, BOOL preserveDetail)
         [state.host restoreListBackgrounds];
         // Stop suppressing the feed before its item setter runs, then discard
         // this presentation's snapshot so reopening cannot reuse stale items.
+        ApolloDuoRemovePostPane(state.host);
         state.host.postsColumnsPaired = NO;
         if (state.feedActions) {
             (state.feedActionsItem ?: state.feed.viewControllers.firstObject.navigationItem).rightBarButtonItems = state.feedActions;
@@ -5934,7 +6046,13 @@ static CGFloat ApolloDuoEmptyStateCenterX(UILabel *label, CGFloat nativeX) {
 }
 - (void)viewDidLayoutSubviews {
     %orig;
-    ApolloDuoPageScheduleLayoutControl((UIViewController *)self);
+    UIViewController *page = (UIViewController *)self;
+    ApolloDuoPageScheduleLayoutControl(page);
+    ApolloDuoSplitState *state = ApolloDuoSplitStateForNavigation(page.navigationController, NO);
+    if (state.host.postsColumnsPaired && state.secondary.topViewController == page
+        && state.host.postPaneModel != ApolloObjectIvar(page, "link")) {
+        [state.host.viewIfLoaded setNeedsLayout];
+    }
 }
 - (void)viewWillDisappear:(BOOL)animated {
     if (objc_getAssociatedObject(self, &kApolloDuoPageLayoutKey)
